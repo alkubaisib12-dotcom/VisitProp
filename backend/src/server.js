@@ -11,11 +11,36 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// CORS
+// - Fixes: your server was sending Access-Control-Allow-Origin: http://localhost:3000
+// - Now: allows the Vercel domain + localhost (and optional extra origins via FRONTEND_URL / FRONTEND_URLS)
+const defaultAllowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'https://visit-prop-6i8s.vercel.app',
+];
+
+const envOrigins = [
+  process.env.FRONTEND_URL,
+  ...(process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',') : []),
+]
+  .map((s) => (s || '').trim())
+  .filter(Boolean);
+
+const allowedOrigins = Array.from(new Set([...defaultAllowedOrigins, ...envOrigins]));
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true); // allow server-to-server / curl
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+  })
+);
+
 // Middleware
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true
-}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -34,7 +59,7 @@ app.get('/', (req, res) => {
     message: 'VisitProp Backend API (OAuth 2.0)',
     version: '2.0.0',
     authentication: '/auth/login',
-    documentation: '/api/health'
+    documentation: '/api/health',
   });
 });
 
@@ -52,40 +77,42 @@ app.use((err, req, res, next) => {
         error: 'File too large',
         message: 'Maximum file size is 10MB',
         details: `The uploaded file exceeds the 10MB size limit`,
-        code: 'LIMIT_FILE_SIZE'
+        code: 'LIMIT_FILE_SIZE',
       });
     } else if (err.code === 'LIMIT_FILE_COUNT') {
       return res.status(400).json({
         error: 'Too many files',
         message: 'Maximum 10 files allowed',
         details: 'You can upload up to 10 files at once',
-        code: 'LIMIT_FILE_COUNT'
+        code: 'LIMIT_FILE_COUNT',
       });
     } else if (err.code === 'LIMIT_UNEXPECTED_FILE') {
       return res.status(400).json({
         error: 'Unexpected file field',
         message: 'Invalid file field name',
         details: 'Use "file" for single upload or "files" for multiple uploads',
-        code: 'LIMIT_UNEXPECTED_FILE'
+        code: 'LIMIT_UNEXPECTED_FILE',
       });
     } else {
       return res.status(400).json({
         error: 'File upload error',
         message: err.message,
         details: 'An error occurred during file upload',
-        code: err.code
+        code: err.code,
       });
     }
   }
 
   // Handle file filter errors (file type validation)
-  if (err.message?.includes('Only image files are allowed') ||
-      err.message?.includes('Only images, PDFs, Word documents')) {
+  if (
+    err.message?.includes('Only image files are allowed') ||
+    err.message?.includes('Only images, PDFs, Word documents')
+  ) {
     return res.status(400).json({
       error: 'Invalid file type',
       message: err.message,
       details: 'Please check the allowed file types for this subfolder',
-      code: 'INVALID_FILE_TYPE'
+      code: 'INVALID_FILE_TYPE',
     });
   }
 
@@ -93,7 +120,7 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({
     error: err.message || 'Internal server error',
     details: err.status === 500 ? 'An unexpected error occurred. Please try again.' : err.message,
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
   });
 });
 
@@ -101,7 +128,7 @@ app.use((err, req, res, next) => {
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not found',
-    message: `Cannot ${req.method} ${req.path}`
+    message: `Cannot ${req.method} ${req.path}`,
   });
 });
 
@@ -127,6 +154,9 @@ async function startServer() {
       console.log(`   POST http://localhost:${PORT}/api/upload`);
       console.log(`   POST http://localhost:${PORT}/api/reports`);
       console.log(`   GET  http://localhost:${PORT}/api/reports`);
+      console.log('');
+      console.log('🌐 CORS Allowed Origins:');
+      allowedOrigins.forEach((o) => console.log(`   ✅ ${o}`));
       console.log('');
       console.log('🔗 Connected Services:');
       console.log(`   📊 Properties Sheet: ${process.env.GOOGLE_SHEETS_PROPERTIES_ID}`);
