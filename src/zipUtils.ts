@@ -49,7 +49,6 @@ function estimateStringBytes(s: string): number {
   try {
     return new TextEncoder().encode(s).length;
   } catch {
-    // fallback
     return s.length * 2;
   }
 }
@@ -76,7 +75,6 @@ async function compressImageFileIfNeeded(file: File): Promise<File> {
   if (!file.type.startsWith('image/')) return file;
   if (file.size < IMAGE_COMPRESS_THRESHOLD) return file;
 
-  // If browser can’t decode (e.g., HEIC), just return original.
   try {
     const img = await loadImageFromBlob(file);
 
@@ -97,16 +95,10 @@ async function compressImageFileIfNeeded(file: File): Promise<File> {
     ctx.drawImage(img, 0, 0, outW, outH);
 
     const outBlob: Blob | null = await new Promise((resolve) => {
-      canvas.toBlob(
-        (b) => resolve(b),
-        'image/jpeg',
-        JPEG_QUALITY
-      );
+      canvas.toBlob((b) => resolve(b), 'image/jpeg', JPEG_QUALITY);
     });
 
     if (!outBlob) return file;
-
-    // If compression didn’t help, keep original
     if (outBlob.size >= file.size) return file;
 
     const base = sanitizeFilename(file.name.replace(/\.[^.]+$/, '') || 'photo');
@@ -117,20 +109,10 @@ async function compressImageFileIfNeeded(file: File): Promise<File> {
   }
 }
 
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result));
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(blob);
-  });
-}
-
 /**
- * IMPORTANT CHANGE:
- * - To keep size under control, we DO NOT inline images anymore.
- * - Instead, the PDF DOM must use HTTP URLs (uploadedUrl) for <img src>.
- * - If we detect blob: URLs, we throw a clear error so you upload first.
+ * IMPORTANT:
+ * - We DO NOT inline images into HTML (base64) because it explodes size.
+ * - For printing/exporting HTML, images must be normal https URLs (uploadedUrl).
  */
 function assertNoBlobImages(root: HTMLElement): void {
   const imgs = Array.from(root.querySelectorAll('img'));
@@ -158,8 +140,9 @@ function collectCssText(): string {
 }
 
 /**
- * Build HTML from #pdf-content with injected CSS.
- * No base64 images to keep payload size small.
+ * Build HTML from the SAME DOM used for printing (#pdf-content),
+ * with injected CSS (no image inlining).
+ * Backend should print this HTML to a real PDF.
  */
 export async function buildPdfHtmlFromDom(pdfContentId: string = 'pdf-content'): Promise<string> {
   const el = document.getElementById(pdfContentId);
