@@ -242,6 +242,12 @@ label:has(+ textarea[required])::after {
     pointer-events: auto !important;
     width: 100% !important;
   }
+
+  /* ✅ FIX: force all children visible too (prevents white/blank print in some browsers) */
+  .property-report-form #pdf-content,
+  .property-report-form #pdf-content * {
+    visibility: visible !important;
+  }
 }
 
 @media (max-width: 767px) {

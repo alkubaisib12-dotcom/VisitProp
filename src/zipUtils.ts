@@ -2,6 +2,11 @@ import { PropertyReport } from './types';
 import { sanitizeFilename, generatePdfFilename } from './pdfUtils';
 import { downloadBundleZip } from './api';
 
+const MAX_TOTAL_BYTES = 100 * 1024 * 1024; // 100MB total (files + pdfHtml)
+const IMAGE_COMPRESS_THRESHOLD = 2 * 1024 * 1024; // compress images larger than 2MB
+const IMAGE_MAX_DIM = 2000; // max width/height after resize
+const JPEG_QUALITY = 0.82;
+
 async function fetchBlob(url: string): Promise<Blob | null> {
   try {
     const res = await fetch(url);
@@ -10,6 +15,12 @@ async function fetchBlob(url: string): Promise<Blob | null> {
   } catch {
     return null;
   }
+}
+
+function formatBytes(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1024) return `${mb.toFixed(2)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
 }
 
 function getFileExtensionFromNameOrMime(name: string, mime?: string): string {
@@ -34,8 +45,80 @@ function pickBestName(obj: unknown, fallback: string): string {
   return fallback;
 }
 
-async function blobToDataUrl(blob: Blob): Promise<string> {
-  return await new Promise((resolve, reject) => {
+function estimateStringBytes(s: string): number {
+  try {
+    return new TextEncoder().encode(s).length;
+  } catch {
+    // fallback
+    return s.length * 2;
+  }
+}
+
+async function loadImageFromBlob(blob: Blob): Promise<HTMLImageElement> {
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    img.decoding = 'async';
+    img.loading = 'eager';
+    img.crossOrigin = 'anonymous';
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('Failed to load image'));
+      img.src = url;
+    });
+    return img;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function compressImageFileIfNeeded(file: File): Promise<File> {
+  if (!file.type.startsWith('image/')) return file;
+  if (file.size < IMAGE_COMPRESS_THRESHOLD) return file;
+
+  // If browser can’t decode (e.g., HEIC), just return original.
+  try {
+    const img = await loadImageFromBlob(file);
+
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (!w || !h) return file;
+
+    const scale = Math.min(1, IMAGE_MAX_DIM / Math.max(w, h));
+    const outW = Math.max(1, Math.round(w * scale));
+    const outH = Math.max(1, Math.round(h * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return file;
+
+    ctx.drawImage(img, 0, 0, outW, outH);
+
+    const outBlob: Blob | null = await new Promise((resolve) => {
+      canvas.toBlob(
+        (b) => resolve(b),
+        'image/jpeg',
+        JPEG_QUALITY
+      );
+    });
+
+    if (!outBlob) return file;
+
+    // If compression didn’t help, keep original
+    if (outBlob.size >= file.size) return file;
+
+    const base = sanitizeFilename(file.name.replace(/\.[^.]+$/, '') || 'photo');
+    const newName = `${base}.jpg`;
+    return new File([outBlob], newName, { type: 'image/jpeg', lastModified: Date.now() });
+  } catch {
+    return file;
+  }
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
     const r = new FileReader();
     r.onload = () => resolve(String(r.result));
     r.onerror = () => reject(r.error);
@@ -43,23 +126,23 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
-async function inlineImages(root: HTMLElement): Promise<void> {
+/**
+ * IMPORTANT CHANGE:
+ * - To keep size under control, we DO NOT inline images anymore.
+ * - Instead, the PDF DOM must use HTTP URLs (uploadedUrl) for <img src>.
+ * - If we detect blob: URLs, we throw a clear error so you upload first.
+ */
+function assertNoBlobImages(root: HTMLElement): void {
   const imgs = Array.from(root.querySelectorAll('img'));
-  await Promise.all(
-    imgs.map(async (img) => {
-      const src = img.getAttribute('src') || '';
-      if (!src || src.startsWith('data:')) return;
-      try {
-        const res = await fetch(src);
-        if (!res.ok) return;
-        const blob = await res.blob();
-        const dataUrl = await blobToDataUrl(blob);
-        img.setAttribute('src', dataUrl);
-      } catch {
-        // ignore
-      }
-    })
-  );
+  const bad = imgs.find((img) => {
+    const src = (img.getAttribute('src') || '').trim();
+    return src.startsWith('blob:');
+  });
+  if (bad) {
+    throw new Error(
+      'Cannot generate PDF HTML with local (blob) images. Upload photos first so <img src> uses uploadedUrl (https).'
+    );
+  }
 }
 
 function collectCssText(): string {
@@ -75,9 +158,8 @@ function collectCssText(): string {
 }
 
 /**
- * Build HTML from the SAME DOM used for printing (#pdf-content),
- * with inlined images + injected CSS.
- * Backend will print this HTML to a REAL PDF (not image PDF).
+ * Build HTML from #pdf-content with injected CSS.
+ * No base64 images to keep payload size small.
  */
 export async function buildPdfHtmlFromDom(pdfContentId: string = 'pdf-content'): Promise<string> {
   const el = document.getElementById(pdfContentId);
@@ -87,7 +169,8 @@ export async function buildPdfHtmlFromDom(pdfContentId: string = 'pdf-content'):
   clone.classList.remove('pdf-content-hidden');
   clone.style.display = 'block';
 
-  await inlineImages(clone);
+  // critical: don't allow blob images (forces uploadedUrl usage)
+  assertNoBlobImages(clone);
 
   const cssText = collectCssText();
   const baseHref = window.location.origin + '/';
@@ -194,8 +277,28 @@ export async function downloadReportZip(report: PropertyReport): Promise<void> {
     }
   }
 
+  // OPTIONAL: compress large images to keep total size reasonable
+  for (let i = 0; i < filesPayload.length; i++) {
+    const f = filesPayload[i].file;
+    if (f instanceof File && f.size > 0 && f.type.startsWith('image/')) {
+      filesPayload[i].file = await compressImageFileIfNeeded(f);
+    }
+  }
+
   const pdfHtml = await buildPdfHtmlFromDom('pdf-content');
   const pdfFileName = generatePdfFilename(report);
+
+  // total size check (files + pdfHtml bytes)
+  const filesBytes = filesPayload.reduce((sum, x) => sum + (x.file?.size || 0), 0);
+  const htmlBytes = estimateStringBytes(pdfHtml);
+  const total = filesBytes + htmlBytes;
+
+  if (total > MAX_TOTAL_BYTES) {
+    throw new Error(
+      `Bundle too large: ${formatBytes(total)}. Max allowed is ${formatBytes(MAX_TOTAL_BYTES)}. ` +
+        `Try removing some photos or let compression reduce size.`
+    );
+  }
 
   await downloadBundleZip(report, filesPayload, { pdfHtml, pdfFileName });
 }

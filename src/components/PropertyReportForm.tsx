@@ -39,6 +39,40 @@ function hasMeaningfulReportData(report: PropertyReport): boolean {
   );
 }
 
+function raf2(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+}
+
+function waitForFonts(timeoutMs: number = 2500): Promise<void> {
+  const anyDoc = document as any;
+  const fonts = anyDoc?.fonts;
+  if (!fonts?.ready) return Promise.resolve();
+
+  return Promise.race([
+    fonts.ready.then(() => undefined).catch(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
+function waitForImages(root: HTMLElement, timeoutMs: number = 4000): Promise<void> {
+  const imgs = Array.from(root.querySelectorAll('img'));
+  if (imgs.length === 0) return Promise.resolve();
+
+  const waits = imgs.map((img) => {
+    if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+
+    return new Promise<void>((resolve) => {
+      const done = () => resolve();
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', done, { once: true });
+
+      setTimeout(() => resolve(), timeoutMs);
+    });
+  });
+
+  return Promise.all(waits).then(() => undefined);
+}
+
 export default function PropertyReportForm() {
   const [selectedProperty, setSelectedProperty] = useState<Property | null>(null);
   const [formData, setFormData] = useState({
@@ -72,10 +106,14 @@ export default function PropertyReportForm() {
   const [printQueued, setPrintQueued] = useState(false);
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
 
+  // snapshot used ONLY for printing to avoid “white page” from async rendering timing
+  const [printSnapshot, setPrintSnapshot] = useState<PropertyReport | null>(null);
+
   const isMobile = useMemo(() => isProbablyMobile(), []);
 
   const handlePropertySelect = (property: Property | null) => {
     setSelectedProperty(property);
+    setPrintSnapshot(null);
 
     if (property) {
       setFormData((prev) => ({
@@ -135,8 +173,6 @@ export default function PropertyReportForm() {
       return 'يرجى كتابة تفاصيل البلاغ | Please enter complaint details';
     }
 
-
-
     return null;
   };
 
@@ -177,20 +213,23 @@ export default function PropertyReportForm() {
     };
   };
 
+  // For UI/hidden PDF DOM: use snapshot while printing, otherwise live report
+  const liveReportForPdf = buildCurrentReport();
+  const reportForPdfDom = printSnapshot || liveReportForPdf;
+
   useEffect(() => {
     if (!printQueued) return;
 
     const run = async () => {
-      const currentReport = buildCurrentReport();
+      const currentReport = printSnapshot || buildCurrentReport();
       if (!currentReport) {
         setPrintQueued(false);
         return;
       }
 
       try {
-        await new Promise<void>((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-        );
+        // allow React to render #pdf-content with the snapshot
+        await raf2();
 
         const baseValidation = validateForExport();
         if (baseValidation) {
@@ -213,6 +252,15 @@ export default function PropertyReportForm() {
         }
 
         setPdfError(null);
+
+        // Wait for fonts + images inside #pdf-content to avoid “white page”
+        const pdfEl = document.getElementById('pdf-content');
+        if (pdfEl) {
+          await waitForFonts();
+          await waitForImages(pdfEl);
+          await raf2();
+        }
+
         await printReport(currentReport);
       } catch (error: any) {
         console.error('Print error:', error);
@@ -223,6 +271,7 @@ export default function PropertyReportForm() {
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } finally {
         setPrintQueued(false);
+        setPrintSnapshot(null);
       }
     };
 
@@ -232,6 +281,12 @@ export default function PropertyReportForm() {
 
   const handlePrint = async () => {
     setPdfError(null);
+
+    const report = buildCurrentReport();
+    if (!report) return;
+
+    // snapshot first, then queue print (ensures DOM renders stable report)
+    setPrintSnapshot(report);
     setPrintQueued(true);
   };
 
@@ -256,9 +311,7 @@ export default function PropertyReportForm() {
     setZipError(null);
 
     try {
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-      );
+      await raf2();
 
       const pdfValidationError = validateReportForPdf(currentReport);
       if (pdfValidationError) {
@@ -280,8 +333,6 @@ export default function PropertyReportForm() {
   const isFormDisabled = !selectedProperty;
   const isPrintButtonDisabled = !selectedProperty || printQueued;
   const isZipButtonDisabled = !selectedProperty || isDownloadingZip;
-
-  const currentReportForPdf = buildCurrentReport();
 
   return (
     <>
@@ -594,16 +645,20 @@ export default function PropertyReportForm() {
                 </div>
               )}
             </div>
+
+            {/* ✅ IMPORTANT: keep PDF DOM INSIDE the form (many print CSS rules assume this) */}
+            {reportForPdfDom && (
+              <div
+                id="pdf-content"
+                className="pdf-content-hidden"
+                aria-hidden="true"
+              >
+                <PropertyReportPdfView report={reportForPdfDom} generatedDate={formatBahrainDate()} />
+              </div>
+            )}
           </>
         )}
       </form>
-
-      {/* Keep the PDF DOM mounted, but hidden off-screen (no UI impact) */}
-      {currentReportForPdf && (
-        <div id="pdf-content" className="pdf-content-hidden" aria-hidden="true">
-          <PropertyReportPdfView report={currentReportForPdf} generatedDate={formatBahrainDate()} />
-        </div>
-      )}
     </>
   );
 }
